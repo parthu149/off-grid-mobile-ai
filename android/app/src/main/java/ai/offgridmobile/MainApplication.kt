@@ -9,6 +9,7 @@ import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
 import ai.offgridmobile.download.DownloadManagerPackage
 import ai.offgridmobile.localdream.LocalDreamPackage
 import ai.offgridmobile.pdf.PDFExtractorPackage
+// Note: MnnTextPackage is in the same directory, so it doesn't need a special import!
 
 class MainApplication : Application(), ReactApplication {
 
@@ -21,6 +22,7 @@ class MainApplication : Application(), ReactApplication {
           add(DownloadManagerPackage())
           add(LocalDreamPackage())
           add(PDFExtractorPackage())
+          add(MnnTextPackage()) // <-- WE ADDED THIS LINE
         },
     )
   }
