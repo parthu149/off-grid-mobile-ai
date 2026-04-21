@@ -1,5 +1,5 @@
 import { LlamaContext, RNLlamaOAICompatibleMessage } from 'llama.rn';
-import { Platform } from 'react-native';
+import { Platform, NativeModules, NativeEventEmitter } from 'react-native';
 import RNFS from 'react-native-fs';
 import { Message, INFERENCE_BACKENDS } from '../types';
 import { APP_CONFIG } from '../constants';
@@ -18,18 +18,26 @@ import { generateWithToolsImpl } from './llmToolGeneration';
 import type { ToolCall } from './tools/types';
 import type { MultimodalSupport, LLMPerformanceSettings, LLMPerformanceStats } from './llmTypes';
 import logger from '../utils/logger';
+
+// --- MNN BRIDGE SETUP ---
+const { MnnTextModule } = NativeModules;
+const mnnEmitter = new NativeEventEmitter(MnnTextModule);
+
 export type { MultimodalSupport, LLMPerformanceSettings, LLMPerformanceStats } from './llmTypes';
 export type StreamToken = { content?: string; reasoningContent?: string };
 type StreamCallback = (data: StreamToken) => void;
 type CompleteCallback = (result: { content: string; reasoningContent: string }) => void;
+
 function resolveGpuBackend(enabled: boolean, devices: string[]): string {
   if (!enabled) return 'CPU';
   return Platform.OS === 'ios' ? 'Metal' : (devices.length > 0 ? devices.join(', ') : 'OpenCL');
 }
+
 class LLMService {
   private context: LlamaContext | null = null;
   private currentModelPath: string | null = null;
   private isGenerating: boolean = false;
+  private isMnnEngineActive: boolean = false; // Flag for routing
   private activeCompletionPromise: Promise<void> | null = null;
   private multimodalSupport: MultimodalSupport | null = null;
   private multimodalInitialized: boolean = false;
@@ -42,17 +50,20 @@ class LLMService {
   private toolCallingSupported: boolean = false;
   private thinkingSupported: boolean = false;
   private sessionCacheDir: string = `${RNFS.CachesDirectoryPath}/llm-sessions`;
-  /** Serializes loadModel / unloadModel / reloadWithSettings to prevent concurrent native context init. */
+  
   private contextMutexPromise: Promise<void> = Promise.resolve();
+  
   private acquireContextMutex(): { release: () => void; ready: Promise<void> } {
     let release: () => void = () => {};
     const prev = this.contextMutexPromise;
     this.contextMutexPromise = new Promise<void>(resolve => { release = resolve; });
     return { release, ready: prev.catch(() => {}) };
   }
+  
   private hashString(value: string): string { return hashString(value); }
   private ensureSessionCacheDir(): Promise<void> { return ensureSessionCacheDir(this.sessionCacheDir); }
   private getSessionPath(promptHash: string): string { return getSessionPath(this.sessionCacheDir, promptHash); }
+  
   private async validateAndPrepareModel(modelPath: string): Promise<{ fileSize: number; memCheck: Awaited<ReturnType<typeof checkMemoryForModel>>; params: ReturnType<typeof buildModelParams> }> {
     logger.log(`[LLM] validateAndPrepareModel: ${modelPath}`);
     if (!await RNFS.exists(modelPath)) throw new Error(`Model file not found at: ${modelPath}`);
@@ -61,8 +72,6 @@ class LLMService {
     const settings = useAppStore.getState().settings;
     logger.log(`[LLM] User settings: threads=${settings.nThreads}, batch=${settings.nBatch}, ctx=${settings.contextLength}, gpu=${settings.enableGpu}, flashAttn=${settings.flashAttn}, cache=${settings.cacheType}`);
     const recommendedThreads = await hardwareService.getRecommendedThreadCount();
-    // nThreads === 0 is the "auto" sentinel — substitute the hardware-recommended count.
-    // Any explicit user choice (1–12) is respected as-is.
     const effectiveNThreads = settings.nThreads === 0 ? recommendedThreads : settings.nThreads;
     const params = buildModelParams(modelPath, { ...settings, nThreads: effectiveNThreads });
     logger.log(`[LLM] Resolved params: threads=${params.nThreads}, batch=${params.nBatch}, ctx=${params.ctxLen}, gpuLayers=${params.nGpuLayers}`);
@@ -73,6 +82,7 @@ class LLMService {
     logger.log(`[LLM] Memory check: estimatedMB=${memCheck.estimatedMB.toFixed(0)}, availableMB=${memCheck.availableMB.toFixed(0)}, safe=${memCheck.safe}`);
     return { fileSize, memCheck, params };
   }
+  
   private async applyLoadedContext(opts: { context: LlamaContext; actualLength: number; gpuAttemptFailed: boolean; nGpuLayers: number; modelPath: string; mmProjPath?: string }): Promise<void> {
     const { context, actualLength, gpuAttemptFailed, nGpuLayers, modelPath, mmProjPath } = opts;
     this.context = context;
@@ -88,11 +98,27 @@ class LLMService {
     this.detectToolCallingSupport(); this.detectThinkingSupport();
     logger.log(`[LLM] Model loaded, vision: ${this.supportsVision()}, tools: ${this.toolCallingSupported}, thinking: ${this.thinkingSupported}`);
   }
+  
   async loadModel(modelPath: string, mmProjPath?: string): Promise<void> {
     const mutex = this.acquireContextMutex();
     try {
       await mutex.ready;
-      // Re-check after acquiring mutex — another call may have loaded the same model
+
+      // --- PHASE 3: MNN ROUTER ---
+      this.isMnnEngineActive = !modelPath.toLowerCase().endsWith('.gguf');
+      if (this.isMnnEngineActive) {
+        if (this.currentModelPath === modelPath) return; // Already loaded
+        
+        logger.log(`[LLM] Routing to Android MNN Engine: ${modelPath}`);
+        this.currentModelPath = modelPath;
+        
+        // Pass the config.json inside the MNN folder directly to the Android Bridge
+        const configPath = `${modelPath}/llm_config.json`;
+        await MnnTextModule.loadModel(configPath);
+        return; 
+      }
+      // --- END MNN ROUTER ---
+
       if (this.context && this.currentModelPath === modelPath) return;
       if (this.context && this.currentModelPath !== modelPath) {
         logger.log('[LLM] Releasing previous context before loading new model');
@@ -116,6 +142,7 @@ class LLMService {
       mutex.release();
     }
   }
+  
   private async initWithAutoContext(params: { baseParams: object; ctxLen: number; nGpuLayers: number }): Promise<{ context: LlamaContext; gpuAttemptFailed: boolean; actualLength: number }> {
     const deviceInfo = await hardwareService.getDeviceInfo();
     let safeGpuLayers = getGpuLayersForDevice(deviceInfo.totalMemory, params.nGpuLayers);
@@ -125,8 +152,6 @@ class LLMService {
       const settings = useAppStore.getState().settings;
       const backend = settings?.inferenceBackend ?? INFERENCE_BACKENDS.CPU;
       if (backend === INFERENCE_BACKENDS.HTP) {
-        // HTP routes to the Hexagon NPU — not subject to Adreno GPU layer caps,
-        // but we still respect the RAM-based safeGpuLayers floor (0 on ≤4GB devices).
         safeGpuLayers = safeGpuLayers > 0 ? (settings?.gpuLayers ?? 99) : 0;
         resolvedBaseParams = { ...params.baseParams, devices: ['HTP0'] };
         const socInfo = await hardwareService.getSoCInfo();
@@ -137,7 +162,6 @@ class LLMService {
           logger.warn(`[LLM] OpenCL requested but not supported (${capability.reason}), falling back to CPU`);
           safeGpuLayers = 0;
         } else {
-          // Respect the Adreno-specific RAM cap — safeGpuLayers already has it applied.
           logger.log(`[LLM] OpenCL backend — offloading ${safeGpuLayers} layers to GPU`);
         }
       } else {
@@ -156,6 +180,7 @@ class LLMService {
     try { await initial.context.release(); } catch (e) { logger.warn('[LLM] Error releasing initial context:', e); }
     return initContextWithFallback(resolvedBaseParams, targetCtx, safeGpuLayers);
   }
+  
   async initializeMultimodal(mmProjPath: string): Promise<boolean> {
     if (!this.context) { logger.warn('[LLM] initializeMultimodal: no context'); return false; }
     try {
@@ -170,10 +195,12 @@ class LLMService {
     this.multimodalSupport = support;
     return initialized;
   }
+  
   async checkMultimodalSupport(): Promise<MultimodalSupport> {
     if (!this.context) { this.multimodalSupport = { vision: false, audio: false }; return this.multimodalSupport; }
     this.multimodalSupport = await checkContextMultimodal(this.context); return this.multimodalSupport;
   }
+  
   getMultimodalSupport(): MultimodalSupport | null { return this.multimodalSupport; }
   supportsVision(): boolean { return this.multimodalSupport?.vision || false; }
   supportsToolCalling(): boolean { return this.toolCallingSupported; }
@@ -183,8 +210,9 @@ class LLMService {
     const path = this.currentModelPath?.toLowerCase() ?? '';
     return path.includes('gemma-4') || path.includes('gemma4');
   }
-  /** Disable ctx_shift on Android when GPU layers are active — the OpenCL backend SIGSEGVs on the ggml set op used by KV cache shifting. */
+  
   private shouldDisableCtxShift(): boolean { return Platform.OS === 'android' && this.activeGpuLayers > 0; }
+  
   private detectToolCallingSupport(): void {
     if (!this.context) { this.toolCallingSupported = false; return; }
     try {
@@ -197,11 +225,22 @@ class LLMService {
       logger.log('[LLM][TOOLS] toolCallingSupported =', this.toolCallingSupported);
     } catch (e) { logger.warn('[LLM] Error detecting tool calling support:', e); this.toolCallingSupported = false; }
   }
+  
   private detectThinkingSupport(): void {
     this.thinkingSupported = supportsNativeThinking(this.context);
   }
-  /** Internal unload without acquiring the mutex (used by loadModel which already holds it). */
+  
   private async doUnloadModel(): Promise<void> {
+    // --- MNN CLEANUP ---
+    if (this.isMnnEngineActive) {
+      logger.log('[LLM] Releasing MNN Engine');
+      mnnEmitter.removeAllListeners('onMnnToken');
+      this.isMnnEngineActive = false;
+      this.currentModelPath = null;
+      return;
+    }
+    // --- END MNN CLEANUP ---
+
     if (!this.context) return;
     if (this.isGenerating) {
       try { await this.context.stopCompletion(); } catch (e) { logger.log('[LLM] Stop during unload:', e); }
@@ -212,13 +251,49 @@ class LLMService {
     useAppStore.getState().setModelMaxContext(null);
     Object.assign(this, { context: null, currentModelPath: null, multimodalSupport: null, multimodalInitialized: false, toolCallingSupported: false, thinkingSupported: false, gpuEnabled: false, gpuReason: '', gpuDevices: [], activeGpuLayers: 0 });
   }
+  
   async unloadModel(): Promise<void> {
     const mutex = this.acquireContextMutex();
     try { await mutex.ready; await this.doUnloadModel(); } finally { mutex.release(); }
   }
-  isModelLoaded(): boolean { return this.context !== null; }
+  
+  isModelLoaded(): boolean { return this.context !== null || this.isMnnEngineActive; }
   getLoadedModelPath(): string | null { return this.currentModelPath; }
+  
   async generateResponse(messages: Message[], onStream?: StreamCallback, onComplete?: CompleteCallback): Promise<string> {
+    // --- PHASE 3: MNN GENERATOR ---
+    if (this.isMnnEngineActive) {
+      if (this.isGenerating) throw new Error('Generation already in progress');
+      this.isGenerating = true;
+
+      return new Promise(async (resolve, reject) => {
+        let fullContent = '';
+
+        // Listen for words coming back from Android
+        const listener = mnnEmitter.addListener('onMnnToken', (token: string) => {
+          fullContent += token;
+          onStream?.({ content: token }); 
+        });
+
+        try {
+          // Format chat history for MNN
+          const prompt = messages.map(m => `<|im_start|>${m.role}\n${m.content}<|im_end|>`).join('\n') + '\n<|im_start|>assistant\n';
+          
+          await MnnTextModule.generateText(prompt);
+
+          listener.remove();
+          this.isGenerating = false;
+          onComplete?.({ content: fullContent, reasoningContent: '' });
+          resolve(fullContent);
+        } catch (e) {
+          listener.remove();
+          this.isGenerating = false;
+          reject(e);
+        }
+      });
+    }
+    // --- END MNN GENERATOR ---
+
     if (!this.context) throw new Error('No model loaded');
     if (this.isGenerating) throw new Error('Generation already in progress');
     this.isGenerating = true;
@@ -260,6 +335,7 @@ class LLMService {
     this.activeCompletionPromise = completionWork.then(() => { }, () => { });
     try { return await completionWork; } finally { this.isGenerating = false; this.activeCompletionPromise = null; }
   }
+  
   async generateResponseWithTools(messages: Message[], options: { tools: any[]; onStream?: StreamCallback; onComplete?: CompleteCallback }): Promise<{ fullResponse: string; toolCalls: ToolCall[] }> {
     const work = generateWithToolsImpl({
       context: this.context, isGenerating: this.isGenerating,
@@ -279,11 +355,11 @@ class LLMService {
     this.activeCompletionPromise = work.then(() => { }, () => { });
     try { return await work; } finally { this.activeCompletionPromise = null; }
   }
-  /** No-op pass-through — lets llama.rn's native ctx_shift handle overflow for KV cache reuse. */
+  
   private async manageContextWindow(messages: Message[], _extraReserve = 0): Promise<Message[]> {
     return messages;
   }
-  /** Generate a completion with a hard token cap (used for summarization, not user-facing). */
+  
   async generateWithMaxTokens(messages: Message[], maxTokens: number): Promise<string> {
     if (!this.context) throw new Error('No model loaded');
     if (this.isGenerating) throw new Error('Generation already in progress');
@@ -299,40 +375,56 @@ class LLMService {
     this.activeCompletionPromise = completionWork.then(() => { }, () => { });
     try { await completionWork; return fullResponse.trim(); } finally { this.isGenerating = false; this.activeCompletionPromise = null; }
   }
+  
   async stopGeneration(): Promise<void> {
+    if (this.isMnnEngineActive) {
+      MnnTextModule.stopGeneration(); // Tell Android to stop
+      this.isGenerating = false;
+      return;
+    }
+
     if (this.context) { try { await this.context.stopCompletion(); } catch (e) { logger.log('[LLM] Stop error:', e); } }
     this.isGenerating = false;
     if (this.activeCompletionPromise !== null) { await this.activeCompletionPromise; this.activeCompletionPromise = null; }
   }
+  
   async clearKVCache(clearData: boolean = false): Promise<void> {
     if (!this.context || this.isGenerating) return;
     try { await (this.context as any).clearCache(clearData); } catch (e) { logger.log('[LLM] Clear cache error:', e); }
   }
+  
   getEstimatedMemoryUsage() {
     const contextMemoryMB = this.context ? (this.currentSettings.contextLength || 2048) * 0.5 : 0;
     return { contextMemoryMB, totalEstimatedMB: contextMemoryMB };
   }
+  
   getGpuInfo() {
     return { gpu: this.gpuEnabled, gpuBackend: resolveGpuBackend(this.gpuEnabled, this.gpuDevices), gpuLayers: this.activeGpuLayers, reasonNoGPU: this.gpuReason };
   }
+  
   isCurrentlyGenerating(): boolean { return this.isGenerating; }
   private formatMessages(messages: Message[]): string { return formatLlamaMessages(messages, this.supportsVision()); }
   private convertToOAIMessages(messages: Message[]): RNLlamaOAICompatibleMessage[] { return buildOAIMessages(messages); }
   async getModelInfo() { return this.context ? { contextLength: APP_CONFIG.maxContextLength, vocabSize: 0 } : null; }
+  
   async tokenize(text: string) {
     if (!this.context) throw new Error('No model loaded');
     return (await this.context.tokenize(text)).tokens || [];
   }
+  
   async getTokenCount(text: string) {
     if (!this.context) throw new Error('No model loaded');
     return (await this.context.tokenize(text)).tokens?.length || 0;
   }
+  
   async estimateContextUsage(messages: Message[]) {
     const tokenCount = await this.getTokenCount(this.formatMessages(messages));
     const ctxLen = this.currentSettings.contextLength || APP_CONFIG.maxContextLength;
     return { tokenCount, percentUsed: (tokenCount / ctxLen) * 100, willFit: tokenCount < ctxLen * 0.9 };
   }
+  
   getFormattedPrompt(messages: Message[]): string { return this.formatMessages(messages); }
+  
   async getContextDebugInfo(messages: Message[]) {
     const managed = await this.manageContextWindow(messages);
     const fmt = this.formatMessages(managed);
@@ -347,12 +439,15 @@ class LLMService {
       formattedPrompt: fmt, estimatedTokens: tokens, maxContextLength: ctx, contextUsagePercent: (tokens / ctx) * 100
     };
   }
+  
   updatePerformanceSettings(settings: Partial<LLMPerformanceSettings>): void {
     this.currentSettings = { ...this.currentSettings, ...settings };
     logger.log('[LLM] Performance settings updated:', this.currentSettings);
   }
+  
   getPerformanceSettings(): LLMPerformanceSettings { return { ...this.currentSettings }; }
   getPerformanceStats(): LLMPerformanceStats { return { ...this.performanceStats }; }
+  
   async reloadWithSettings(modelPath: string, settings: LLMPerformanceSettings): Promise<void> {
     const mutex = this.acquireContextMutex();
     try {
@@ -370,4 +465,5 @@ class LLMService {
     } finally { mutex.release(); }
   }
 }
+
 export const llmService = new LLMService();
