@@ -1,42 +1,51 @@
-package ai.offgridmobile // <-- CHANGE THIS TO MATCH YOUR APP
+package ai.offgridmobile
 
-import com.facebook.react.bridge.Promise
-import com.facebook.react.bridge.ReactApplicationContext
-import com.facebook.react.bridge.ReactContextBaseJavaModule
-import com.facebook.react.bridge.ReactMethod
+import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
 
 class MnnTextModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
 
-    override fun getName(): String {
-        return "MnnTextModule" // This is the name React Native will use to call it
+    init {
+        // This wakes up the C++ file we are about to create
+        System.loadLibrary("mnn_engine_native") 
     }
 
-    // 1. Function to Load the Model
+    override fun getName(): String {
+        return "MnnTextModule"
+    }
+
+    // These link directly to the C++ engine
+    private external fun initMnnEngine(configPath: String): Boolean
+    private external fun startGeneration(prompt: String)
+    private external fun stopEngineGeneration()
+
     @ReactMethod
     fun loadModel(modelDir: String, promise: Promise) {
-        try {
-            // We will connect this to the actual Alibaba C++ code in Phase 3.
-            // For now, this acts as a placeholder so React Native doesn't crash.
-            promise.resolve("MNN Engine Successfully Woken Up for: $modelDir")
-        } catch (e: Exception) {
-            promise.reject("MNN_LOAD_ERROR", e.message)
+        // The TS bridge sends the folder, but the C++ engine needs the config.json path
+        val configPath = "$modelDir/llm_config.json"
+        
+        if (initMnnEngine(configPath)) {
+            promise.resolve(true)
+        } else {
+            promise.reject("MNN_ERROR", "Failed to load MNN model in C++")
         }
     }
 
-    // 2. Function to Generate Text
     @ReactMethod
     fun generateText(prompt: String, promise: Promise) {
-        try {
-            // Placeholder: This will eventually trigger the C++ MNN generation loop
-            promise.resolve("This is a placeholder response from the MNN Android Brain!")
-        } catch (e: Exception) {
-            promise.reject("MNN_GENERATE_ERROR", e.message)
-        }
+        Thread {
+            startGeneration(prompt)
+            promise.resolve(null)
+        }.start()
     }
 
-    // 3. Helper to send individual words/tokens back to the UI for streaming
-    fun emitToken(token: String) {
+    @ReactMethod
+    fun stopGeneration() {
+        stopEngineGeneration()
+    }
+
+    // The C++ code will trigger this function to send words back to the UI
+    fun onToken(token: String) {
         reactApplicationContext
             .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
             .emit("onMnnToken", token)
