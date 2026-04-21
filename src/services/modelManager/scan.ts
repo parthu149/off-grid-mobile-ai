@@ -159,7 +159,48 @@ async function doScanForUntrackedTextModels(
 
   for (const item of items) {
     const lowerName = item.name.toLowerCase();
+
+    // --- PHASE 1: NEW MNN DIRECTORY SCANNER ---
+    if (item.isDirectory()) {
+      if (registeredPaths.has(item.path)) continue;
+
+      try {
+        const folderContents = await RNFS.readDir(item.path);
+        // Look inside the folder for MNN files
+        const hasMnnFiles = folderContents.some(f => 
+          f.name === 'lm.mnn' || f.name === 'llm_config.json'
+        );
+
+        if (hasMnnFiles) {
+          const folderSize = await getDirSize(item.path); 
+          
+          const newModel: DownloadedModel = {
+            id: `recovered_mnn_${item.name}_${Date.now()}`,
+            name: item.name.replace(/[_-]/g, ' '), // Cleans up the folder name for the UI
+            author: 'Local MNN',
+            filePath: item.path, // We save the FOLDER path here
+            fileName: item.name,
+            fileSize: folderSize,
+            quantization: 'MNN', // This tags it so our router knows what engine to use later
+            downloadedAt: new Date().toISOString(),
+            credibility: { source: 'community', isOfficial: false, isVerifiedQuantizer: false },
+          };
+
+          const models = await getModels();
+          models.push(newModel);
+          await saveModelsList(models);
+          discoveredModels.push(newModel);
+        }
+      } catch {
+        // Silently skip if a directory can't be read
+      }
+      continue; 
+    }
+    // --- END MNN SCANNER ---
+
     const isMmProj = isMMProjFile(lowerName);
+    
+    // Your existing GGUF logic remains perfectly intact here
     if (!item.isFile() || !item.name.endsWith('.gguf') || registeredPaths.has(item.path) || isMmProj) {
       continue;
     }
@@ -190,6 +231,7 @@ async function doScanForUntrackedTextModels(
 
   return discoveredModels;
 }
+
 
 export interface ImportLocalModelOpts {
   sourceUri: string;
